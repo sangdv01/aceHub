@@ -49,10 +49,6 @@ class AceEngineManager(private val context: Context, private val listener: Engin
         private set
     var accessToken: String? = null
         private set
-    @Volatile var isEngineReady: Boolean = false
-        private set
-    @Volatile var isStarting: Boolean = false
-        private set
 
     private val engineCallback = object : IAceStreamEngineCallback.Stub() {
         override fun onReady(port: Int) {
@@ -112,101 +108,114 @@ class AceEngineManager(private val context: Context, private val listener: Engin
         }
     }
 
-    @Synchronized
     fun bindAndStart() {
-        if (isStarting) {
-            Log.w(TAG, "bindAndStart already in progress, skipping duplicate call")
-            return
-        }
-        isStarting = true
-        isEngineReady = false
-
         Thread {
-            try {
-                // 1. Check if headless engine is already listening on loopback
-                if (isSocketAlive("127.0.0.1", 62062) || isSocketAlive("127.0.0.1", 6878)) {
-                    boundPackage = "org.acestream.engine"
-                    boundVersion = "AceStream Headless Engine 3.2.17 (0 Ads)"
-                    httpApiPort = 6878
-                    engineApiPort = 62062
-                    Log.i(TAG, "Discovered active headless AceStream on 127.0.0.1:62062!")
-                    isEngineReady = true
-                    isStarting = false
-                    mainHandler.post {
-                        listener.onEngineStateChanged("READY", "Connected to AceStream Headless Engine (0 Ads)")
-                        listener.onEngineReady(httpApiPort, engineApiPort, boundPackage, boundVersion)
-                    }
-                    return@Thread
+            // 1. Check if headless engine is already listening on loopback
+            if (isSocketAlive("127.0.0.1", 62062) || isSocketAlive("127.0.0.1", 6878)) {
+                boundPackage = "org.acestream.engine"
+                boundVersion = "AceStream Headless Engine 3.2.17 (0 Ads)"
+                httpApiPort = 6878
+                engineApiPort = 62062
+                Log.i(TAG, "Discovered active headless AceStream on 127.0.0.1:62062!")
+                mainHandler.post {
+                    listener.onEngineStateChanged("READY", "Connected to AceStream Headless Engine (0 Ads)")
+                    listener.onEngineReady(httpApiPort, engineApiPort, boundPackage, boundVersion)
                 }
+                return@Thread
+            }
 
-                // 2. Launch embedded AceStream Linux engine directly
-                try {
-                    val runtime = EmbeddedAceRuntime(context)
-                    embeddedRuntime = runtime
-                    mainHandler.post { listener.onEngineStateChanged("PREPARING", "Extracting embedded AceStream Linux Engine...") }
-                    runtime.prepare()
-                    mainHandler.post { listener.onEngineStateChanged("STARTING", "Launching embedded AceStream Linux Engine...") }
-                    runtime.start()
-                    AppLogger.i("ENGINE_MGR", "Đang đợi Engine mở cổng 62062 / 6878...")
-                    for (i in 1..40) {
-                        Thread.sleep(500)
+            // 2. Launch embedded AceStream Linux engine directly
+            try {
+                val runtime = EmbeddedAceRuntime(context)
+                embeddedRuntime = runtime
+                mainHandler.post { listener.onEngineStateChanged("PREPARING", "Extracting embedded AceStream Linux Engine...") }
+                runtime.prepare()
+                mainHandler.post { listener.onEngineStateChanged("STARTING", "Launching embedded AceStream Linux Engine...") }
+                runtime.start()
+                for (i in 1..25) {
+                    Thread.sleep(500)
+                    if (isSocketAlive("127.0.0.1", 62062) || isSocketAlive("127.0.0.1", 6878)) {
+                        boundPackage = context.packageName
+                        boundVersion = "AceStream Embedded Engine 3.2.17 (0 Ads)"
+                        httpApiPort = 6878
+                        engineApiPort = 62062
+                        Log.i(TAG, "Embedded AceStream engine running on 127.0.0.1:62062!")
+                        mainHandler.post {
+                            listener.onEngineStateChanged("READY", "Embedded AceStream Engine ready (0 Ads)")
+                            listener.onEngineReady(httpApiPort, engineApiPort, boundPackage, boundVersion)
+                        }
+                        return@Thread
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Embedded engine startup failed: ${e.message}, falling back...")
+            }
+
+            // 3. Fallback: Wake up HaP if installed
+            try {
+                val launchIntent = context.packageManager.getLaunchIntentForPackage("com.streamvault.plugin.hap")
+                if (launchIntent != null) {
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launchIntent)
+                    for (i in 1..10) {
+                        Thread.sleep(600)
                         if (isSocketAlive("127.0.0.1", 62062) || isSocketAlive("127.0.0.1", 6878)) {
-                            boundPackage = context.packageName
-                            boundVersion = "AceStream Embedded Engine 3.2.17 (0 Ads)"
+                            boundPackage = "com.streamvault.plugin.hap"
+                            boundVersion = "AceServe 3.2.17 Headless (0 Ads)"
                             httpApiPort = 6878
                             engineApiPort = 62062
-                            Log.i(TAG, "Embedded AceStream engine running on 127.0.0.1:62062!")
-                            AppLogger.s("ENGINE_MGR", "🟢 Engine đã mở cổng 127.0.0.1:62062 thành công! (Thử $i/40)")
-                            isEngineReady = true
-                            isStarting = false
+                            Log.i(TAG, "AceServe woke up on 127.0.0.1:62062!")
                             mainHandler.post {
-                                listener.onEngineStateChanged("READY", "Embedded AceStream Engine ready (0 Ads)")
+                                listener.onEngineStateChanged("READY", "AceServe Headless Engine ready")
                                 listener.onEngineReady(httpApiPort, engineApiPort, boundPackage, boundVersion)
                             }
                             return@Thread
                         }
                     }
-                    AppLogger.w("ENGINE_MGR", "⚠️ Engine chưa mở cổng sau 20 giây, kiểm tra phương án dự phòng...")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Embedded engine startup failed: ${e.message}, falling back...")
-                    AppLogger.e("ENGINE_MGR", "Khởi động Embedded Engine thất bại: ${e.message}", e)
                 }
-
-                // 3. Fallback: Wake up HaP if installed
-                try {
-                    val launchIntent = context.packageManager.getLaunchIntentForPackage("com.streamvault.plugin.hap")
-                    if (launchIntent != null) {
-                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        context.startActivity(launchIntent)
-                        for (i in 1..10) {
-                            Thread.sleep(600)
-                            if (isSocketAlive("127.0.0.1", 62062) || isSocketAlive("127.0.0.1", 6878)) {
-                                boundPackage = "com.streamvault.plugin.hap"
-                                boundVersion = "AceServe 3.2.17 Headless (0 Ads)"
-                                httpApiPort = 6878
-                                engineApiPort = 62062
-                                Log.i(TAG, "AceServe woke up on 127.0.0.1:62062!")
-                                isEngineReady = true
-                                isStarting = false
-                                mainHandler.post {
-                                    listener.onEngineStateChanged("READY", "AceServe Headless Engine ready")
-                                    listener.onEngineReady(httpApiPort, engineApiPort, boundPackage, boundVersion)
-                                }
-                                return@Thread
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to start HaP: ${e.message}")
-                }
-
-                // 4. Fallback: Legacy AIDL bind
-                mainHandler.post { doLegacyBindAndStart() }
             } catch (e: Exception) {
-                isStarting = false
-                Log.e(TAG, "Error in bindAndStart thread", e)
+                Log.w(TAG, "Failed to start HaP: ${e.message}")
             }
+
+            // 4. Fallback: Legacy AIDL bind
+            mainHandler.post { doLegacyBindAndStart() }
         }.start()
+    }
+
+    @Volatile var engineRestarts = 0
+        private set
+
+    fun isEngineAlive(): Boolean =
+        embeddedRuntime?.isRunning() == true || isSocketAlive("127.0.0.1", 6878) || isSocketAlive("127.0.0.1", 62062)
+
+    /**
+     * v1.4.4 engine supervisor (called from the health thread every ~20 s): if the embedded engine process
+     * died (e.g. low-memory kill on the 1.8 GB FPT box) restart it and re-announce READY so the hub re-prewarms.
+     */
+    fun superviseEngine() {
+        if (isEngineAlive()) return
+        // Engine adopted from a previous process (no runtime handle) or embedded: (re)create our own runtime.
+        val rt = embeddedRuntime ?: if (boundPackage == "org.acestream.engine" || boundPackage == context.packageName)
+            EmbeddedAceRuntime(context).also { it.prepare(); embeddedRuntime = it } else return
+        Log.w(TAG, "Embedded engine is DOWN - restarting it (restart #${engineRestarts + 1})")
+        try {
+            rt.stop()
+            rt.start()
+            engineRestarts++
+            for (i in 1..30) {
+                Thread.sleep(500)
+                if (isSocketAlive("127.0.0.1", 62062) || isSocketAlive("127.0.0.1", 6878)) {
+                    mainHandler.post {
+                        listener.onEngineStateChanged("READY", "Embedded engine restarted by supervisor")
+                        listener.onEngineReady(6878, 62062, boundPackage, boundVersion)
+                    }
+                    return
+                }
+            }
+            Log.e(TAG, "Engine restart: port did not open within 15 s")
+        } catch (e: Exception) {
+            Log.e(TAG, "Engine restart failed: ${e.message}")
+        }
     }
 
     private fun isSocketAlive(host: String, port: Int): Boolean {
@@ -257,13 +266,10 @@ class AceEngineManager(private val context: Context, private val listener: Engin
     }
 
     private fun updateReadyState(success: Boolean) {
-        isStarting = false
         if (!success) {
-            isEngineReady = false
             mainHandler.post { listener.onEngineError("Engine reported start failed (port -1)") }
             return
         }
-        isEngineReady = true
 
         try {
             val service = engineService
@@ -276,7 +282,7 @@ class AceEngineManager(private val context: Context, private val listener: Engin
                 engineApiPort = enginePort
                 accessToken = token
 
-                Log.d(TAG, "Engine READY! httpPort=$httpApiPort enginePort=$engineApiPort token=$accessToken")
+                Log.d(TAG, "Engine READY! httpPort=$httpApiPort enginePort=$engineApiPort token=${if (accessToken.isNullOrEmpty()) "none" else "set"}")
                 mainHandler.post {
                     listener.onEngineReady(httpApiPort, engineApiPort, boundPackage, boundVersion)
                 }
@@ -311,7 +317,7 @@ class AceEngineManager(private val context: Context, private val listener: Engin
             if (match != null) {
                 val tok = match.groupValues[1]
                 accessToken = tok
-                Log.i(TAG, "Resolved accessToken from process table: $tok")
+                Log.i(TAG, "Resolved accessToken from process table")
                 return tok
             }
         } catch (e: Exception) {
@@ -341,8 +347,6 @@ class AceEngineManager(private val context: Context, private val listener: Engin
     }
 
     fun unbind() {
-        isEngineReady = false
-        isStarting = false
         embeddedRuntime?.stop()
         embeddedRuntime = null
         if (isBound) {

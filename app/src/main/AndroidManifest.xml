@@ -19,6 +19,7 @@
 
     <!-- Package Visibility for Android 11+ (API 30+) -->
     <queries>
+        <package android:name="com.tailscale.ipn" />
         <package android:name="org.acestream.core.web" />
         <package android:name="org.acestream.core.atv" />
         <package android:name="org.acestream.media.atv" />
@@ -33,7 +34,7 @@
         android:allowBackup="true"
         android:icon="@drawable/app_icon"
         android:banner="@drawable/app_icon"
-        android:label="@string/app_name"
+        android:label="AceHub"
         android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@style/Theme.AceSportG2Probe">
@@ -54,14 +55,18 @@
             android:name=".G2OrchestratorService"
             android:enabled="true"
             android:exported="true"
-            android:directBootAware="true"
+            android:foregroundServiceType="dataSync" />
+
+        <service
+            android:name=".control.AceHubControlService"
+            android:enabled="true"
+            android:exported="false"
             android:foregroundServiceType="dataSync" />
 
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
-            android:exported="true"
-            android:directBootAware="true">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
