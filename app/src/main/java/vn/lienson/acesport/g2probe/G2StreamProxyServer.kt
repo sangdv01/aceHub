@@ -567,6 +567,103 @@ class G2StreamProxyServer(
                 return@withContext
             }
 
+            // 5c. Box System Reboot / Shutdown (LAN only)
+            if (rawUri.startsWith("/reboot-box") || rawUri.startsWith("/box/reboot")) {
+                if (!isPrivateSubnet(clientSock)) {
+                    sendHttpError(out, 403, "Forbidden")
+                    clientSock.close()
+                    return@withContext
+                }
+                val html = """
+                    <!DOCTYPE html>
+                    <html lang="vi">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Đang khởi động lại Box...</title>
+                        <meta http-equiv="refresh" content="35;url=/">
+                        <style>
+                            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; padding: 40px 20px; text-align: center; }
+                            .card { background: #1e293b; border-radius: 12px; padding: 30px; max-width: 500px; margin: 0 auto; border: 1px solid #334155; }
+                            h1 { color: #38bdf8; font-size: 22px; margin-bottom: 12px; }
+                            p { color: #94a3b8; line-height: 1.6; }
+                            .spinner { border: 4px solid rgba(255,255,255,0.1); width: 40px; height: 40px; border-radius: 50%; border-left-color: #38bdf8; margin: 20px auto; animation: spin 1s linear infinite; }
+                            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="card">
+                            <div class="spinner"></div>
+                            <h1>🔄 Đang Khởi Động Lại TV Box...</h1>
+                            <p>Hệ thống đã nhận lệnh và đang khởi động lại phần cứng Box.</p>
+                            <p>Trình duyệt sẽ tự động kết nối lại sau <b>35 giây</b>.</p>
+                        </div>
+                    </body>
+                    </html>
+                """.trimIndent()
+                sendHttpResponse(out, "text/html; charset=utf-8", html.toByteArray(Charsets.UTF_8))
+                clientSock.close()
+                scope.launch(Dispatchers.IO) {
+                    delay(800)
+                    try {
+                        Runtime.getRuntime().exec(arrayOf("su", "-c", "sync; reboot"))
+                    } catch (_: Exception) {
+                        try {
+                            Runtime.getRuntime().exec(arrayOf("reboot"))
+                        } catch (_: Exception) {}
+                    }
+                }
+                return@withContext
+            }
+
+            if (rawUri.startsWith("/shutdown-box") || rawUri.startsWith("/box/shutdown")) {
+                if (!isPrivateSubnet(clientSock)) {
+                    sendHttpError(out, 403, "Forbidden")
+                    clientSock.close()
+                    return@withContext
+                }
+                val html = """
+                    <!DOCTYPE html>
+                    <html lang="vi">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Đã Tắt Nguồn Box</title>
+                        <style>
+                            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; padding: 40px 20px; text-align: center; }
+                            .card { background: #1e293b; border-radius: 12px; padding: 30px; max-width: 500px; margin: 0 auto; border: 1px solid #ef4444; }
+                            h1 { color: #ef4444; font-size: 22px; margin-bottom: 12px; }
+                            p { color: #cbd5e1; line-height: 1.6; }
+                            .warning { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); padding: 12px; border-radius: 8px; margin-top: 15px; color: #fca5a5; font-size: 14px; text-align: left; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="card">
+                            <h1>⏻ Đã Tắt Nguồn TV Box Thành Công</h1>
+                            <p>TV Box đã nhận lệnh và đang ngắt toàn bộ nguồn điện.</p>
+                            <div class="warning">
+                                <b>⚠️ Cách bật lại Box (Do không có remote):</b><br>
+                                Bạn vui lòng <b>rút phích cắm nguồn điện của Box ra rồi cắm lại</b> để khởi động Box.
+                            </div>
+                        </div>
+                    </body>
+                    </html>
+                """.trimIndent()
+                sendHttpResponse(out, "text/html; charset=utf-8", html.toByteArray(Charsets.UTF_8))
+                clientSock.close()
+                scope.launch(Dispatchers.IO) {
+                    delay(800)
+                    try {
+                        Runtime.getRuntime().exec(arrayOf("su", "-c", "sync; reboot -p"))
+                    } catch (_: Exception) {
+                        try {
+                            Runtime.getRuntime().exec(arrayOf("reboot", "-p"))
+                        } catch (_: Exception) {}
+                    }
+                }
+                return@withContext
+            }
+
             // 6. Stream Dispatch: Parse /content/..., /channels/..., /ace/getstream, /pid/..., /infohash/..., /stream/...
             var channelId = ""
             var sourceType = "content_id"
@@ -1056,6 +1153,15 @@ class G2StreamProxyServer(
                 <a href="/status" class="btn" target="_blank">Xem JSON Status</a>
                 <a href="/config" class="btn" target="_blank" style="background:#059669;">Xem JSON Config</a>
                 <a href="/stop" class="btn btn-stop">Dừng Luồng</a>
+            </div>
+        </div>
+
+        <div class="card" style="border: 1px solid #475569;">
+            <h2 style="color:#f87171;">Điều Khiển TV Box (Không Cần Remote)</h2>
+            <p style="color:#94a3b8;font-size:14px;margin-bottom:15px;">Thao tác trực tiếp phần cứng TV Box qua mạng nội bộ:</p>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <a href="/reboot-box" onclick="return confirm('Bạn có chắc muốn KHỞI ĐỘNG LẠI (Restart) Box không?\n\nBox sẽ tự tắt và khởi động lại sau khoảng 30-40 giây.')" class="btn" style="background:#ea580c;">🔄 Khởi Động Lại Box</a>
+                <a href="/shutdown-box" onclick="return confirm('⚠️ CẢNH BÁO TẮT NGUỒN:\n\nBox sẽ tắt hẳn nguồn điện. Vì bạn KHÔNG CÓ REMOTE, để bật lại bạn sẽ cần RÚT PHÍCH CẮM NGUỒN RA RỒI CẮM LẠI.\n\nBạn có chắc muốn tắt nguồn Box không?')" class="btn btn-stop">⏻ Tắt Box</a>
             </div>
         </div>
 

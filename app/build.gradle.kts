@@ -23,8 +23,8 @@ android {
         applicationId = "vn.lienson.acesport.g2probe"
         minSdk = 24
         targetSdk = 34
-        versionCode = 22
-        versionName = "1.4.4"
+        versionCode = 23
+        versionName = "1.4.5"
 
         buildConfigField("String", "CONTROL_WS_URLS", "\"${acehubCfg("acehub.controlWsUrls")}\"")
         buildConfigField("String", "DEFAULT_CHANNEL_ID", "\"${acehubCfg("acehub.defaultChannel")}\"")

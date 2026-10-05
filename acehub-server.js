@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
+const { spawn } = require('child_process');
 
 const PRODUCT_KEY = "n51LvQoTlJzNGaFxseRK-uvnvX-sD4Vm5Axwmc4UcoD-jruxmKsuJaH0eVgE";
 const PROXY_PORT = parseInt(process.env.ACE_PROXY_PORT || "8000", 10);
@@ -46,46 +47,124 @@ function computeReadyKey(reqKey, productKey = PRODUCT_KEY) {
 // Background VIP Auth Maintainer
 let isEngineVip = false;
 let telnetSocket = null;
+let authRetryTimer = null;
 
-function maintainTelnetAuth() {
-    const port = getAceTelnetPort();
-    telnetSocket = net.createConnection({ host: '127.0.0.1', port }, () => {
-        telnetSocket.write("HELLOBG version=4\r\n");
-    });
-
-    telnetSocket.setEncoding('utf8');
-
-    telnetSocket.on('data', (data) => {
-        const lines = data.split(/\r?\n/);
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            if (trimmed.startsWith("HELLOTS")) {
-                const match = trimmed.match(/key=([^\s]+)/);
-                if (match) {
-                    const ready = computeReadyKey(match[1]);
-                    telnetSocket.write(`READY key=${ready}\r\n`);
-                }
-            } else if (trimmed.startsWith("AUTH")) {
-                isEngineVip = true;
-                console.log(`[aceHub] VIP Auth 0 Confirmed: ${trimmed} (No Ads)`);
-                telnetSocket.write("SETOPTIONS use_stop_notifications=1\r\n");
-            }
-        }
-    });
-
-    telnetSocket.on('error', (err) => {
-        isEngineVip = false;
-    });
-
-    telnetSocket.on('close', () => {
-        isEngineVip = false;
-        setTimeout(maintainTelnetAuth, 5000); // Reconnect if closed
-    });
+async function isAceHttpAlive() {
+    try {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch(`http://127.0.0.1:${ACE_HTTP_PORT}/webui/api/service?method=get_version`, { signal: controller.signal }).catch(() => null);
+        clearTimeout(t);
+        return Boolean(res && res.ok);
+    } catch (e) {
+        return false;
+    }
 }
 
-maintainTelnetAuth();
+async function ensureAceEngine() {
+    if (await isAceHttpAlive()) {
+        return true;
+    }
+
+    const appData = process.env.APPDATA || '';
+    const consoleExe = path.join(appData, 'ACEStream', 'engine', 'ace_console.exe');
+    const engineExe = path.join(appData, 'ACEStream', 'engine', 'ace_engine.exe');
+
+    let targetExe = null;
+    let targetArgs = [];
+
+    if (fs.existsSync(consoleExe)) {
+        targetExe = consoleExe;
+        targetArgs = ['--client-console'];
+    } else if (fs.existsSync(engineExe)) {
+        targetExe = engineExe;
+        targetArgs = [];
+    }
+
+    if (!targetExe) {
+        console.warn('[aceHub] AceStream executable not found in AppData.');
+        return false;
+    }
+
+    console.log(`[aceHub] Auto-starting AceStream engine: ${targetExe} ${targetArgs.join(' ')}`);
+    try {
+        const p = spawn(targetExe, targetArgs, {
+            cwd: path.dirname(targetExe),
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true
+        });
+        p.unref();
+
+        for (let i = 0; i < 20; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            if (await isAceHttpAlive()) {
+                console.log('[aceHub] AceStream engine started successfully and ready on port ' + ACE_HTTP_PORT);
+                maintainTelnetAuth();
+                return true;
+            }
+        }
+    } catch (err) {
+        console.error('[aceHub] Failed to start AceStream engine:', err.message);
+    }
+    return false;
+}
+
+function maintainTelnetAuth() {
+    if (authRetryTimer) {
+        clearTimeout(authRetryTimer);
+        authRetryTimer = null;
+    }
+
+    const port = getAceTelnetPort();
+    try {
+        if (telnetSocket) {
+            try { telnetSocket.destroy(); } catch (e) {}
+            telnetSocket = null;
+        }
+
+        telnetSocket = net.createConnection({ host: '127.0.0.1', port }, () => {
+            telnetSocket.write("HELLOBG version=4\r\n");
+        });
+
+        telnetSocket.setEncoding('utf8');
+
+        telnetSocket.on('data', (data) => {
+            const lines = data.split(/\r?\n/);
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+
+                if (trimmed.startsWith("HELLOTS")) {
+                    const match = trimmed.match(/key=([^\s]+)/);
+                    if (match) {
+                        const ready = computeReadyKey(match[1]);
+                        telnetSocket.write(`READY key=${ready}\r\n`);
+                    }
+                } else if (trimmed.startsWith("AUTH")) {
+                    isEngineVip = true;
+                    console.log(`[aceHub] VIP Auth 0 Confirmed: ${trimmed} (No Ads)`);
+                    telnetSocket.write("SETOPTIONS use_stop_notifications=1\r\n");
+                }
+            }
+        });
+
+        telnetSocket.on('error', () => {
+            isEngineVip = false;
+        });
+
+        telnetSocket.on('close', () => {
+            isEngineVip = false;
+            authRetryTimer = setTimeout(maintainTelnetAuth, 3000);
+        });
+    } catch (e) {
+        isEngineVip = false;
+        authRetryTimer = setTimeout(maintainTelnetAuth, 3000);
+    }
+}
+
+// Auto-check AceStream engine on start
+ensureAceEngine().then(() => maintainTelnetAuth());
 
 // Stream State
 let activeStreamInfo = null;
@@ -170,6 +249,7 @@ const server = http.createServer(async (req, res) => {
     const parsed = url.parse(req.url, true);
     const pathname = parsed.pathname;
     const query = parsed.query;
+    const localIp = getLocalIp();
 
     if (req.method === 'HEAD') {
         res.writeHead(200, {
@@ -321,6 +401,112 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Playlist .m3u handler (Opens directly in VLC / Ace Player / PotPlayer)
+    if (pathname === '/playlist.m3u' || pathname === '/play.m3u' || pathname.endsWith('.m3u')) {
+        const streamId = query.id || query.infohash || 'default';
+        const channelName = query.name || 'AceHub Live Channel';
+        const streamUrl = `http://${localIp}:${PROXY_PORT}/live?id=${streamId}`;
+        const m3uContent = `#EXTM3U\n#EXTINF:-1 tvg-id="${streamId}" tvg-name="${channelName}",${channelName}\n${streamUrl}\n`;
+        res.writeHead(200, {
+            'Content-Type': 'audio/x-mpegurl; charset=utf-8',
+            'Content-Disposition': `attachment; filename="${encodeURIComponent(channelName)}.m3u"`,
+            'Access-Control-Allow-Origin': '*'
+        });
+        res.end(m3uContent);
+        return;
+    }
+
+    // Web HTML5 Video Player using mpegts.js (Plays MPEG-TS directly in Chrome/Edge!)
+    if (pathname === '/player' || pathname === '/play') {
+        const streamId = query.id || query.infohash || '';
+        const channelName = query.name || 'AceStream Live';
+        if (!streamId) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end("Thiếu mã kênh id");
+            return;
+        }
+        const streamUrl = `/live?id=${streamId}`;
+        const playerHtml = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>aceHub Player | ${channelName}</title>
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { background:#090d16; color:#f8fafc; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; padding:16px; }
+        .player-container { width:100%; max-width:960px; background:#121929; border:1px solid #1e293b; border-radius:16px; overflow:hidden; box-shadow:0 20px 40px rgba(0,0,0,0.5); }
+        .player-header { padding:14px 20px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e293b; flex-wrap:wrap; gap:10px; }
+        .channel-title { font-weight:700; font-size:16px; color:#38bdf8; display:flex; align-items:center; gap:8px; }
+        .video-box { position:relative; width:100%; padding-top:56.25%; background:#000; }
+        video { position:absolute; top:0; left:0; width:100%; height:100%; outline:none; }
+        .player-footer { padding:14px 20px; display:flex; justify-content:space-between; align-items:center; font-size:13px; color:#94a3b8; flex-wrap:wrap; gap:10px; }
+        .btn { padding:7px 14px; border-radius:6px; font-weight:500; font-size:12px; text-decoration:none; cursor:pointer; border:none; display:inline-flex; align-items:center; gap:6px; transition:0.2s; }
+        .btn-primary { background:#0284c7; color:#fff; }
+        .btn-secondary { background:#1e293b; color:#cbd5e1; }
+        .btn:hover { opacity:0.9; }
+        #statusMessage { font-size:13px; color:#38bdf8; display:flex; align-items:center; gap:6px; }
+    </style>
+</head>
+<body>
+    <div class="player-container">
+        <div class="player-header">
+            <div class="channel-title">⚡ ${channelName} [1080p 50fps]</div>
+            <div style="display:flex; gap:8px;">
+                <a href="/" class="btn btn-secondary">← Về Dashboard</a>
+                <a href="/playlist.m3u?id=${streamId}&name=${encodeURIComponent(channelName)}" class="btn btn-primary">🚀 Mở VLC Player</a>
+            </div>
+        </div>
+        <div class="video-box">
+            <video id="videoPlayer" controls autoplay playsinline></video>
+        </div>
+        <div class="player-footer">
+            <div id="statusMessage">⏳ Đang khởi tạo luồng phát AceStream P2P...</div>
+            <div>Trạm phát: <strong>http://${localIp}:${PROXY_PORT}</strong> (0-Transcode)</div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('videoPlayer');
+        const status = document.getElementById('statusMessage');
+
+        if (mpegts.getFeatureList().mseLivePlayback) {
+            const player = mpegts.createPlayer({
+                type: 'mse',
+                isLive: true,
+                url: '${streamUrl}'
+            }, {
+                enableWorker: true,
+                lazyLoad: false,
+                liveBufferLatencyChasing: true
+            });
+            player.attachMediaElement(video);
+            player.load();
+            player.play().catch(e => console.log('Autoplay deferred:', e));
+
+            player.on(mpegts.Events.LOADING_COMPLETE, () => {
+                status.innerText = '⏹️ Luồng trực tiếp đã kết thúc';
+            });
+            player.on(mpegts.Events.ERROR, (type, detail, info) => {
+                status.innerText = '🔄 Đang kết nối lại trạm phát AceStream...';
+                status.style.color = '#eab308';
+            });
+            video.addEventListener('playing', () => {
+                status.innerText = '🟢 Đang phát trực tiếp [1080p 50fps - 0 ADS]';
+                status.style.color = '#22c55e';
+            });
+        } else {
+            status.innerHTML = 'Trình duyệt không hỗ trợ MSE, vui lòng <a href="/playlist.m3u?id=${streamId}" style="color:#38bdf8;">nhấn vào đây để mở bằng VLC</a>.';
+        }
+    </script>
+</body>
+</html>`;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(playerHtml);
+        return;
+    }
+
     // Stream handler: /live?id=... or /ace/getstream?id=...
     let streamId = query.id || query.content_id || query.pid || query.infohash;
     if (!streamId) {
@@ -387,36 +573,74 @@ const server = http.createServer(async (req, res) => {
     });
 });
 
+const VIP_SPORTS_CHANNELS = [
+    { name: "🇬🇧 Sky Sports Premier League FHD", lang: "eng", infohash: "78266c15035d0ad8cbc58f821733931e1de434ab", badge: "Ngoại Hạng Anh" },
+    { name: "🇵🇱 Canal+ Sport 2 HD (1080p 50fps)", lang: "pol", infohash: "9bd91396b4418ae7c8eed7b8a6964eb8a43de204", badge: "EPL & Cúp C1" },
+    { name: "🇵🇱 Polsat Sport Premium 1 HD (Super Bitrate)", lang: "pol", infohash: "58b193890946b099a7d2c7dca37a48b36a12467f", badge: "Cúp C1 Châu Âu" },
+    { name: "🇪🇸 Movistar LaLiga HD (1080p 50fps)", lang: "spa", infohash: "c1959a27edb0b94c5005a2dea93b7a70d4312f1c", badge: "La Liga TBN" },
+    { name: "🇬🇧 TNT Sports 1 HD (BT Sport)", lang: "eng", infohash: "19c5c13a8e7273d78d53fdaea3deaf1b80e938fa", badge: "Champions League" },
+    { name: "🇬🇧 TNT Sports 2 HD (BT Sport)", lang: "eng", infohash: "01dcc1ea3387c2b73953efe3f52286a770737d7c", badge: "Champions League" }
+];
+
 async function renderDashboard(res) {
     const localIp = getLocalIp();
     
+    // Auto-launch AceStream engine in background if needed
+    ensureAceEngine().catch(() => {});
+
     // Fetch active sports channels
     let sportsHtml = '';
+    const displayList = [...VIP_SPORTS_CHANNELS.map(v => ({
+        name: v.name,
+        infohash: v.infohash,
+        languages: [v.lang],
+        badge: v.badge
+    }))];
+
     try {
-        const channelsRes = await fetch(`http://127.0.0.1:${ACE_HTTP_PORT}/search?page_size=100&page=0`);
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 1500);
+        const channelsRes = await fetch(`http://127.0.0.1:${ACE_HTTP_PORT}/search?page_size=100&page=0`, { signal: controller.signal });
+        clearTimeout(t);
         const json = await channelsRes.json();
         const results = json?.result?.results || [];
-        const sports = [];
         for (const item of results) {
             for (const sub of (item.items || [])) {
                 if (sub.categories && (sub.categories.includes('sport') || sub.name.toLowerCase().includes('sport') || sub.name.toLowerCase().includes('laliga') || sub.name.toLowerCase().includes('arena') || sub.name.toLowerCase().includes('match') || sub.name.toLowerCase().includes('pol'))) {
-                    sports.push(sub);
+                    if (!displayList.some(d => d.infohash === sub.infohash)) {
+                        displayList.push({
+                            name: sub.name,
+                            infohash: sub.infohash,
+                            languages: sub.languages || [],
+                            badge: 'P2P Swarm'
+                        });
+                    }
                 }
             }
         }
-        
-        sportsHtml = sports.slice(0, 15).map(s => `
-            <div style="background: rgba(255,255,255,0.03); border: 1px solid #1e293b; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                    <span style="font-weight: 600; color: #f8fafc;">${s.name}</span>
-                    <span style="font-size: 12px; color: #94a3b8; margin-left: 8px;">[${(s.languages || []).join(',')}]</span>
-                </div>
-                <a href="/live?id=${s.infohash}" target="_blank" style="background: #0284c7; color: white; text-decoration: none; padding: 6px 12px; border-radius: 6px; font-size: 13px; font-weight: 500;">Phát Trực Tiếp</a>
-            </div>
-        `).join('');
     } catch (e) {
-        sportsHtml = '<p style="color:#ef4444;">Không tải được danh sách kênh: ' + e.message + '</p>';
+        // Fallback gracefully to VIP curated list
     }
+
+    sportsHtml = displayList.slice(0, 20).map(s => {
+        const streamLanUrl = `http://${localIp}:${PROXY_PORT}/live?id=${s.infohash}`;
+        const playWebUrl = `/player?id=${s.infohash}&name=${encodeURIComponent(s.name)}`;
+        const vlcUrl = `/playlist.m3u?id=${s.infohash}&name=${encodeURIComponent(s.name)}`;
+        return `
+        <div style="background: rgba(255,255,255,0.03); border: 1px solid #1e293b; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div>
+                <span style="font-weight: 600; color: #f8fafc;">${s.name}</span>
+                <span style="font-size: 11px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 2px 8px; border-radius: 4px; margin-left: 8px;">${s.badge || 'Sport'}</span>
+                <span style="font-size: 12px; color: #94a3b8; margin-left: 8px;">[${(s.languages || []).join(',')}]</span>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center;">
+                <a href="${playWebUrl}" target="_blank" style="background: #0284c7; color: white; text-decoration: none; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 4px;">🎬 Xem Trên Web</a>
+                <a href="${vlcUrl}" style="background: #0d9488; color: white; text-decoration: none; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 4px;">🚀 Mở VLC</a>
+                <button onclick="copyToClipboard('${streamLanUrl}', this)" style="background: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer;">📋 Copy Link TV</button>
+            </div>
+        </div>
+        `;
+    }).join('');
 
     const html = `<!DOCTYPE html>
 <html lang="vi">
@@ -495,9 +719,27 @@ async function renderDashboard(res) {
         <div class="card">
             <h2>Cú pháp phát luồng trên TV (VLC / Kodi / Apple TV / Smart TV)</h2>
             <p>Mở ứng dụng trên TV cùng mạng Wi-Fi và dán:</p>
-            <div class="code-box">http://${localIp}:8000/live?id=&lt;MA_KENH&gt;</div>
+            <div class="code-box">http://${localIp}:${PROXY_PORT}/live?id=&lt;MA_KENH&gt;</div>
         </div>
     </div>
+
+    <script>
+        function copyToClipboard(text, btn) {
+            navigator.clipboard.writeText(text).then(() => {
+                const oldText = btn.innerText;
+                btn.innerText = '✅ Đã Copy!';
+                btn.style.borderColor = '#22c55e';
+                btn.style.color = '#22c55e';
+                setTimeout(() => {
+                    btn.innerText = oldText;
+                    btn.style.borderColor = '#334155';
+                    btn.style.color = '#cbd5e1';
+                }, 2000);
+            }).catch(() => {
+                prompt("Copy link sau:", text);
+            });
+        }
+    </script>
 </body>
 </html>`;
 
