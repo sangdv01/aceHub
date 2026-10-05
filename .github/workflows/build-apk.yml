@@ -36,14 +36,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: aceHub-apk
-          path: app/build/outputs/apk/release/aceHub.apk
+          path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/aceHub.apk
+          files: app/build/outputs/apk/release/*.apk
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
